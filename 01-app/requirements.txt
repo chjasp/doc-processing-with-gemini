@@ -1,0 +1,8 @@
+# for local development
+python-dotenv
+
+# for local development & cloud function
+google-cloud-storage
+google-cloud-firestore
+google-cloud-aiplatform
+PyPDF2
