@@ -1,60 +1,46 @@
-import base64
-import os
 import json
-
-# Conditionally load dotenv for local development
-if os.getenv("ENVIRONMENT") != "production":
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
-
 import vertexai
+import functions_framework
+from google.cloud import firestore
 from vertexai.generative_models import GenerativeModel, Part
-from google.cloud import storage, firestore
 
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME")
-
-# Initialize clients outside the function for performance
-storage_client = storage.Client()
 db = firestore.Client()
-vertexai.init(project=PROJECT_ID)
-model = GenerativeModel(MODEL_NAME)
+vertexai.init()
 
-def handle_pdf(event, context):
-    # Parse the Pub/Sub message
+model = GenerativeModel("gemini-2.0-pro-exp-02-05")
 
-    attributes = event.get('attributes', {})
 
-    bucket_id = attributes.get('bucketId')
-    object_id = attributes.get('objectId')
+@functions_framework.cloud_event
+def handle_pdf(cloud_event):
+    print(f"Event: {cloud_event.data}")
+    
+    bucket_name = cloud_event.data.get("bucket")
+    file_name = cloud_event.data.get("name")
 
-    print(f"New file: {object_id} in bucket: {bucket_id}")
+    print(f"New file: {file_name} in bucket: {bucket_name}")
 
-    # Create GCS URI for the PDF
-    gcs_uri = f"gs://{bucket_id}/{object_id}"
-
-    # Create prompt and PDF part
+    gcs_uri = f"gs://{bucket_name}/{file_name}"
     prompt = "OCR this document and output JSON with relevant fields"
-    
-    pdf_part = Part.from_uri(
-        uri=gcs_uri,
-        mime_type='application/pdf'
-    )
+
+    pdf_part = Part.from_uri(uri=gcs_uri, mime_type="application/pdf")
     contents = [pdf_part, prompt]
-    
+
     response = model.generate_content(contents)
     gemini_response = response.text
-    gemini_response_stripped = gemini_response.replace("```json", "").replace("```", "").strip()
-    
+    gemini_response_stripped = (
+        gemini_response.replace("```json", "").replace("```", "").strip()
+    )
+
     parsed_data = json.loads(gemini_response_stripped)
-    
+
     print(f"Parsed Gemini response: {parsed_data}")
 
-    # Store result in Firestore using the parsed dictionary directly
-    doc_ref = db.collection('pdfs').document(object_id)
+    doc_ref = db.collection("pdfs").document(file_name)
     doc_ref.set(parsed_data)
+
+    print(f"Processed and stored data for {file_name}")
     
-    print(f"Processed and stored data for {object_id}")
+    
+    
+    
+

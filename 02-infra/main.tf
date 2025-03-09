@@ -1,170 +1,161 @@
-###########################
-# Enable Required Services
-###########################
-resource "google_project_service" "enable_storage" {
-  project = var.project_id
-  service = "storage.googleapis.com"
-}
 
-resource "google_project_service" "enable_pubsub" {
-  project = var.project_id
-  service = "pubsub.googleapis.com"
-}
-
-resource "google_project_service" "enable_cloudfunctions" {
-  project = var.project_id
-  service = "cloudfunctions.googleapis.com"
-}
-
-resource "google_project_service" "enable_firestore" {
-  project = var.project_id
-  service = "firestore.googleapis.com"
-}
-
-# Required for Firestore
-resource "google_project_service" "enable_appengine" {
-  project = var.project_id
-  service = "appengine.googleapis.com"
-}
-
-########################
-# Create Storage Bucket
-########################
-resource "google_storage_bucket" "pdf_bucket" {
-  name          = var.bucket_name
-  location      = var.region
-  force_destroy = true
-
-  uniform_bucket_level_access = true
-  
-  depends_on = [
-    google_project_service.enable_storage
-  ]
-}
-
-###################################
-# Create Pub/Sub Topic for uploads
-###################################
-resource "google_pubsub_topic" "pdf_topic" {
-  name      = "pdf-upload-topic"
-  project   = var.project_id
-  depends_on = [
-    google_project_service.enable_pubsub
-  ]
-}
-
-####################################################
-# Create GCS Notification to trigger Pub/Sub message
-####################################################
-resource "google_storage_notification" "pdf_notification" {
-  bucket         = google_storage_bucket.pdf_bucket.name
-  topic          = google_pubsub_topic.pdf_topic.id
-  event_types    = ["OBJECT_FINALIZE"]
-  payload_format = "JSON_API_V1"
-
-  depends_on = [
-    google_storage_bucket.pdf_bucket,
-    google_pubsub_topic.pdf_topic
-  ]
-}
-
-########################################################
-# Create a separate bucket to store Cloud Function code
-########################################################
+#
+# Bucket to store the Cloud Function code: "function_source_bucket"
+#
 resource "google_storage_bucket" "function_source_bucket" {
-  name          = "${var.bucket_name}-function-code"
-  location      = var.region
-  force_destroy = true
-  
+  name                        = "${var.bucket_name}-function-code"
+  location                    = var.region
   uniform_bucket_level_access = true
-  
-  depends_on = [
-    google_project_service.enable_storage
-  ]
 }
 
-############################################
-# Package the function code as a .zip archive
-############################################
-data "archive_file" "function_zip" {
+#
+# Archive the function source code
+#
+data "archive_file" "default" {
   type        = "zip"
   source_dir  = "${path.module}/../01-app"
   output_path = "${path.module}/function_source.zip"
 }
 
-###################################################
+#
 # Upload the zipped code to the function source bucket
-###################################################
-resource "google_storage_bucket_object" "function_source_object" {
-  name   = "function_source.zip"
+#
+resource "google_storage_bucket_object" "default" {
+  name   = "function-source.zip"
   bucket = google_storage_bucket.function_source_bucket.name
-  source = data.archive_file.function_zip.output_path
-  depends_on = [
-    google_storage_bucket.function_source_bucket
-  ]
+  source = data.archive_file.default.output_path
 }
 
-########################
-# Deploy the Cloud Function
-########################
-resource "google_cloudfunctions_function" "handle_pdf" {
+#
+# Bucket that triggers the function: "pdf_bucket"
+#
+resource "google_storage_bucket" "pdf_bucket" {
+  name                        = var.bucket_name
+  location                    = var.region
+  uniform_bucket_level_access = true
+}
+
+#
+# Get the GCS service account for Pub/Sub publishing
+#
+data "google_storage_project_service_account" "default" {
+}
+
+#
+# Identify the project so we can apply roles
+#
+data "google_project" "project" {
+}
+
+#
+# Grant Pub/Sub Publisher so GCS can publish events
+#
+resource "google_project_iam_member" "gcs_pubsub_publishing" {
+  project = data.google_project.project.project_id
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:${data.google_storage_project_service_account.default.email_address}"
+}
+
+#
+# Service account used by the function & trigger
+#
+resource "google_service_account" "account" {
+  account_id   = "gcf-sa"
+  display_name = "Test Service Account - used for both the cloud function and eventarc trigger in the test"
+}
+
+#
+# IAM bindings for invocation/event receiving, etc.
+#
+resource "google_project_iam_member" "invoking" {
+  project    = data.google_project.project.project_id
+  role       = "roles/run.invoker"
+  member     = "serviceAccount:${google_service_account.account.email}"
+  depends_on = [google_project_iam_member.gcs_pubsub_publishing]
+}
+
+resource "google_project_iam_member" "event_receiving" {
+  project    = data.google_project.project.project_id
+  role       = "roles/eventarc.eventReceiver"
+  member     = "serviceAccount:${google_service_account.account.email}"
+  depends_on = [google_project_iam_member.invoking]
+}
+
+resource "google_project_iam_member" "artifactregistry_reader" {
+  project    = data.google_project.project.project_id
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.account.email}"
+  depends_on = [google_project_iam_member.event_receiving]
+}
+
+#
+# Cloud Function (2nd Gen), renamed to "handle_pdf" using names from Code 1
+#
+resource "google_cloudfunctions2_function" "handle_pdf" {
+  depends_on = [
+    google_project_iam_member.event_receiving,
+    google_project_iam_member.artifactregistry_reader,
+  ]
   name        = var.function_name
-  runtime     = "python39"
-  region      = var.region
-  entry_point = "handle_pdf"
-  max_instances = 3
+  location    = var.region
 
-  source_archive_bucket = google_storage_bucket.function_source_bucket.name
-  source_archive_object = google_storage_bucket_object.function_source_object.name
+  build_config {
+    runtime     = "python39"
+    entry_point = "handle_pdf"
+    environment_variables = {
+      ENVIRONMENT       = var.environment
+      GEMINI_MODEL_NAME = var.gemini_model_name
+    }
 
-  environment_variables = {
-    ENVIRONMENT       = var.environment
-    GEMINI_MODEL_NAME = var.gemini_model_name
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_source_bucket.name
+        object = google_storage_bucket_object.default.name
+      }
+    }
   }
 
+  service_config {
+    max_instance_count = 3
+    available_memory   = "2048M"
+    timeout_seconds    = 60
+    environment_variables = {
+      SERVICE_CONFIG_TEST = "config_test"
+    }
+    ingress_settings               = "ALLOW_INTERNAL_ONLY"
+    all_traffic_on_latest_revision = true
+    service_account_email          = google_service_account.account.email
+  }
+
+  # Using an event_trigger block for GCS finalize (instead of Eventarc resource)
   event_trigger {
-    event_type = "google.pubsub.topic.publish"
-    resource   = google_pubsub_topic.pdf_topic.name
+    trigger_region        = var.region
+    event_type            = "google.cloud.storage.object.v1.finalized"
+    retry_policy          = "RETRY_POLICY_RETRY"
+    service_account_email = google_service_account.account.email
+    event_filters {
+      attribute = "bucket"
+      value     = google_storage_bucket.pdf_bucket.name
+    }
   }
-
-  depends_on = [
-    google_project_service.enable_cloudfunctions
-  ]
 }
 
-#######################################
-# Grant the Cloud Function required IAM
-#######################################
-# So it can read from the bucket, subscribe to Pub/Sub, and write to Firestore.
-resource "google_project_iam_member" "function_pubsub_subscriber" {
+resource "google_project_iam_member" "function_vertex_ai_user" {
   project = var.project_id
-  role    = "roles/pubsub.subscriber"
-  member  = "serviceAccount:${google_cloudfunctions_function.handle_pdf.service_account_email}"
+  role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${google_cloudfunctions2_function.handle_pdf.service_config[0].service_account_email}"
 
   depends_on = [
-    google_cloudfunctions_function.handle_pdf,
-    google_project_service.enable_pubsub
-  ]
-}
-
-resource "google_project_iam_member" "function_storage_object_viewer" {
-  project = var.project_id
-  role    = "roles/storage.objectViewer"
-  member  = "serviceAccount:${google_cloudfunctions_function.handle_pdf.service_account_email}"
-
-  depends_on = [
-    google_cloudfunctions_function.handle_pdf,
-    google_project_service.enable_storage
+    google_cloudfunctions2_function.handle_pdf
   ]
 }
 
 resource "google_project_iam_member" "function_firestore_user" {
   project = var.project_id
   role    = "roles/datastore.user"
-  member  = "serviceAccount:${google_cloudfunctions_function.handle_pdf.service_account_email}"
+  member  = "serviceAccount:${google_cloudfunctions2_function.handle_pdf.service_config[0].service_account_email}"
 
   depends_on = [
-    google_cloudfunctions_function.handle_pdf,
-    google_project_service.enable_firestore
+    google_cloudfunctions2_function.handle_pdf
   ]
 }
